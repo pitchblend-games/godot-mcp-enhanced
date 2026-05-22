@@ -14,17 +14,43 @@ func get_open_scripts() -> Dictionary:
 		return {"success": false, "error": "Script editor not available"}
 	
 	var open_scripts = script_editor.get_open_scripts()
-	var scripts_data = []
+	var scripts_data: Array = []
 	
 	for script in open_scripts:
-		if script is Script:
-			var script_info = {
-				"path": script.resource_path,
-				"language": script.get_language().get_name() if script.get_language() else "Unknown",
-				"content": script.source_code,
-				"has_source_code": script.has_source_code()
-			}
-			scripts_data.append(script_info)
+		if not (script is Script):
+			continue
+		
+		# Defensive: a script with a parse error may still appear in the open
+		# list, but accessing its language / source can return null. Don't let
+		# one broken script abort the whole call (which made MCP return {}).
+		var path := ""
+		if script.resource_path:
+			path = script.resource_path
+		
+		# Note: Script.get_language() does NOT exist in Godot 4.6 — calling it
+		# was the bug that made this function return {} (the call crashed the
+		# loop). Derive language from the script's class name instead.
+		var lang_name := "Unknown"
+		match script.get_class():
+			"GDScript":
+				lang_name = "GDScript"
+			"CSharpScript":
+				lang_name = "C#"
+			_:
+				lang_name = script.get_class()
+		
+		var has_source := false
+		var source_code := ""
+		if script.has_source_code():
+			has_source = true
+			source_code = script.source_code
+		
+		scripts_data.append({
+			"path": path,
+			"language": lang_name,
+			"content": source_code,
+			"has_source_code": has_source,
+		})
 	
 	return {"success": true, "data": scripts_data}
 
@@ -217,33 +243,47 @@ func execute_editor_script(code: String) -> Dictionary:
 	if code.strip_edges() == "":
 		return {"success": false, "error": "Empty code provided"}
 	
-	# Create a temporary script
+	# Wrap user code in an execute() method. The literal must NOT add a leading
+	# tab before the insertion point: code.indent("\t") already prepends one tab
+	# to every line, so any extra tab from the literal would over-indent the
+	# first line and break the block.
+	var wrapped_source := "extends Node\n\nfunc execute():\n" + code.indent("\t")
+	if not wrapped_source.ends_with("\n"):
+		wrapped_source += "\n"
+	wrapped_source += "\treturn {\"__mcp_no_return__\": true}\n"
+	
 	var script = GDScript.new()
-	script.source_code = """
-extends Node
-
-func execute():
-	""" + code.indent("\t") + """
-	return {"success": true, "message": "Code executed"}
-"""
+	script.source_code = wrapped_source
 	
 	var error = script.reload()
 	if error != OK:
-		return {"success": false, "error": "Script compilation failed: " + error_string(error)}
+		return {
+			"success": false,
+			"error": "Script compilation failed: " + error_string(error),
+			"wrapped_source": wrapped_source,
+		}
 	
-	# Create instance and execute
 	var instance = script.new()
 	if not instance:
 		return {"success": false, "error": "Failed to create script instance"}
 	
-	var result = null
+	var result: Variant = null
 	if instance.has_method("execute"):
 		result = instance.call("execute")
 	
-	instance.free()
+	if is_instance_valid(instance):
+		instance.free()
 	
 	print("[Script Operations] Executed editor script")
-	return result if result else {"success": true, "message": "Code executed"}
+	
+	# Normalize the return so MCP never gets a bare null (which renders as {}).
+	if result == null:
+		return {"success": true, "message": "Code executed (no return value)"}
+	if result is Dictionary:
+		if result.has("__mcp_no_return__"):
+			return {"success": true, "message": "Code executed (no return value)"}
+		return result
+	return {"success": true, "data": result}
 
 
 func validate_gdscript_syntax(code: String) -> Dictionary:
