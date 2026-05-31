@@ -52,7 +52,11 @@ func _get_script_errors() -> Array:
 				# instead of calling reload() which has side effects
 				if script.has_source_code():
 					var test_script = GDScript.new()
-					test_script.source_code = script.source_code
+					# Strip `class_name` before validating a throwaway copy: re-parsing
+					# source that re-declares an already-registered global class raises a
+					# false "Class X hides a global script class" parse error and prints
+					# it to the editor Output on every poll (RADIATORHEAVEN fix 2026-05-30).
+					test_script.source_code = _strip_class_name(script.source_code)
 					var error = test_script.reload()
 					if error != OK:
 						script_errors.append({
@@ -63,6 +67,20 @@ func _get_script_errors() -> Array:
 						})
 	
 	return script_errors
+
+
+func _strip_class_name(source: String) -> String:
+	## Remove any `class_name` declaration line so a throwaway validation copy
+	## does not re-register an already-defined global class (which would raise a
+	## false "Class X hides a global script class" parse error). The line is
+	## replaced by an empty line to keep reported error line numbers stable.
+	var out := PackedStringArray()
+	for line in source.split("\n"):
+		if line.strip_edges().begins_with("class_name "):
+			out.append("")
+		else:
+			out.append(line)
+	return "\n".join(out)
 
 
 func _get_current_stack_trace() -> Array:
